@@ -4,6 +4,9 @@ const ALLOWED_HOSTS = new Set([
   "huggingface.co",
   "cdn-lfs.huggingface.co",
   "hf-hub-lfs-prod.s3.us-east-1.amazonaws.com",
+  "cdn.hf.co",
+  "us.aws.cdn.hf.co",
+  "cas-server.xethub.hf.co",
 ]);
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -22,23 +25,31 @@ function badRequest(message) {
   return new Response(message, { status: 400, headers: { "content-type": "text/plain; charset=UTF-8" } });
 }
 
+// blob → resolve: HuggingFace blob 页面转直接下载
+function hfBlobToResolve(target) {
+  if (target.hostname !== "huggingface.co") return target;
+  const p = target.pathname;
+  if (!p.includes("/blob/")) return target;
+  return new URL(`https://huggingface.co${p.replace("/blob/", "/resolve/")}${target.search}`);
+}
+
 function targetFromRequest(url) {
   // Full HuggingFace URL form: /https://huggingface.co/user/model/resolve/main/file
   const raw = url.href.slice(url.origin.length + 1);
-  if (raw.startsWith("https://")) return new URL(raw);
+  if (raw.startsWith("https://")) return hfBlobToResolve(new URL(raw));
 
   const parts = url.pathname.split("/").filter(Boolean);
-  // /hf/USER/MODEL/resolve/main/FILE
+  // /hf/USER/MODEL/... (resolve, blob, tree, etc.)
   if (parts[0] === "hf" && parts.length >= 3) {
-    return new URL(`https://huggingface.co/${parts.slice(1).join("/")}${url.search}`);
+    return hfBlobToResolve(new URL(`https://huggingface.co/${parts.slice(1).join("/")}${url.search}`));
   }
   // /api/... -> HuggingFace API
   if (parts[0] === "api" && parts.length >= 2) {
     return new URL(`https://huggingface.co/api/${parts.slice(1).join("/")}${url.search}`);
   }
-  // /models/USER/MODEL/resolve/main/FILE (shortcut)
+  // /models/USER/MODEL/... (shortcut)
   if (parts[0] === "models" && parts.length >= 4) {
-    return new URL(`https://huggingface.co/${parts.join("/")}${url.search}`);
+    return hfBlobToResolve(new URL(`https://huggingface.co/${parts.join("/")}${url.search}`));
   }
   return null;
 }
@@ -53,10 +64,19 @@ function safeHeaders(headers) {
 }
 
 function isCacheableAsset(target) {
-  // Model weights, tokenizer files, configs etc. are immutable once published
-  return target.hostname === "huggingface.co"
-    && /\/resolve\//.test(target.pathname)
-    && !target.pathname.endsWith("/api/");
+  if (target.hostname === "huggingface.co")
+    return /\/resolve\//.test(target.pathname) && !target.pathname.endsWith("/api/");
+  if (target.hostname.endsWith(".hf.co") || target.hostname.endsWith(".huggingface.co"))
+    return true;
+  return false;
+}
+
+// 判断是否为文件下载（需要强制 attachment）
+function isFileDownload(target) {
+  if (target.hostname === "huggingface.co" && /\/resolve\//.test(target.pathname)) return true;
+  if (target.hostname.endsWith(".hf.co") || target.hostname.endsWith(".huggingface.co")) return true;
+  if (target.hostname === "hf-hub-lfs-prod.s3.us-east-1.amazonaws.com") return true;
+  return false;
 }
 
 function proxyUrl(requestUrl, target) {
@@ -92,6 +112,18 @@ async function proxy(request) {
       headers.set("location", proxyUrl(requestUrl, redirectTarget));
     } else {
       headers.set("location", location);
+    }
+  }
+
+  // 强制浏览器下载，而不是在页面中打开
+  if (isFileDownload(target) && request.method === "GET" && upstream.ok) {
+    // 从路径中提取文件名
+    const pathname = target.hostname.endsWith(".hf.co") || target.hostname.endsWith(".huggingface.co")
+      ? new URL(upstream.headers.get("x-final-url") || target).pathname
+      : target.pathname;
+    const filename = decodeURIComponent(pathname.split("/").pop() || "download");
+    if (!headers.has("content-disposition")) {
+      headers.set("content-disposition", `attachment; filename="${filename}"`);
     }
   }
 
