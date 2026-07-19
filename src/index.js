@@ -7,6 +7,7 @@ const ALLOWED_HOSTS = new Set([
   "cdn.hf.co",
   "us.aws.cdn.hf.co",
   "cas-server.xethub.hf.co",
+  "transfer.xethub.hf.co",
 ]);
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -15,8 +16,8 @@ const HOP_BY_HOP_HEADERS = new Set([
   "cf-connecting-ip", "cf-ipcountry", "cf-ray", "x-forwarded-for",
 ]);
 
-const FIXED_LINK_VARIABLES = ["SHORT_LINKS", "FIXED_LINKS", "LINKS"];
-const RESERVED_SHORT_LINKS = new Set(["", "hf", "api", "models", "https:"]);
+const RESERVED_ROUTES = new Set(["hf", "api", "models", "datasets", "spaces", "https:"]);
+const SHORT_LINK_ENV_NAMES = ["SHORT_LINKS", "FIXED_LINKS", "LINKS"];
 
 function html() {
   return new Response(UI, {
@@ -28,75 +29,68 @@ function badRequest(message) {
   return new Response(message, { status: 400, headers: { "content-type": "text/plain; charset=UTF-8" } });
 }
 
-function firstFixedLinksConfig(env = {}) {
-  for (const name of FIXED_LINK_VARIABLES) {
-    if (typeof env[name] === "string" && env[name].trim()) return env[name].trim();
-  }
-  return "";
+function hfBlobToResolve(target) {
+  if (target.hostname !== "huggingface.co") return target;
+
+  const pathname = target.pathname.replace("/blob/", "/resolve/");
+  if (pathname === target.pathname) return target;
+
+  return new URL(`https://huggingface.co${pathname}${target.search}`);
 }
 
-function parseFixedLinks(config) {
-  if (!config) return {};
-  try {
-    const parsed = JSON.parse(config);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
-  } catch {
-    // Fall back to line-based KEY=URL parsing.
-  }
+function parseShortLinks(value) {
+  if (!value) return {};
 
-  return Object.fromEntries(
-    config
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"))
-      .map((line) => {
-        const separator = line.indexOf("=");
-        if (separator === -1) return null;
-        return [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
-      })
-      .filter(Boolean),
-  );
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+
+  if (trimmed.startsWith("{")) return JSON.parse(trimmed);
+
+  return Object.fromEntries(trimmed.split(/\r?\n/).map((line) => {
+    const clean = line.trim();
+    if (!clean || clean.startsWith("#")) return null;
+    const separator = clean.includes("=") ? "=" : ":";
+    const index = clean.indexOf(separator);
+    if (index < 1) return null;
+    return [clean.slice(0, index).trim(), clean.slice(index + 1).trim()];
+  }).filter(Boolean));
 }
 
-function fixedLinkTarget(url, env) {
+function shortLinksFromEnv(env = {}) {
+  for (const name of SHORT_LINK_ENV_NAMES) {
+    if (typeof env[name] === "string" && env[name].trim()) return parseShortLinks(env[name]);
+  }
+  return {};
+}
+
+function shortLinkTarget(url, env) {
   const parts = url.pathname.split("/").filter(Boolean);
-  if (parts.length !== 1 || RESERVED_SHORT_LINKS.has(parts[0])) return null;
+  if (parts.length !== 1 || RESERVED_ROUTES.has(parts[0])) return null;
 
-  const fixedLinks = parseFixedLinks(firstFixedLinksConfig(env));
-  const target = fixedLinks[parts[0]];
+  const links = shortLinksFromEnv(env);
+  const target = links[parts[0]];
   if (typeof target !== "string" || !target.trim()) return null;
 
   return hfBlobToResolve(new URL(target.trim()));
 }
 
-// blob → resolve: HuggingFace blob 页面转直接下载
-function hfBlobToResolve(target) {
-  if (target.hostname !== "huggingface.co") return target;
-  const p = target.pathname;
-  if (!p.includes("/blob/")) return target;
-  return new URL(`https://huggingface.co${p.replace("/blob/", "/resolve/")}${target.search}`);
-}
-
 function targetFromRequest(url, env) {
-  const fixedTarget = fixedLinkTarget(url, env);
-  if (fixedTarget) return fixedTarget;
+  const fixedTarget = shortLinkTarget(url, env);
+  if (fixedTarget) return { target: fixedTarget, isFixedShortLink: true };
 
-  // Full HuggingFace URL form: /https://huggingface.co/user/model/resolve/main/file
+  // Full Hugging Face URL form: /https://huggingface.co/owner/repo/...
   const raw = url.href.slice(url.origin.length + 1);
-  if (raw.startsWith("https://")) return hfBlobToResolve(new URL(raw));
+  if (raw.startsWith("https://")) return { target: hfBlobToResolve(new URL(raw)), isFixedShortLink: false };
 
   const parts = url.pathname.split("/").filter(Boolean);
-  // /hf/USER/MODEL/... (resolve, blob, tree, etc.)
   if (parts[0] === "hf" && parts.length >= 3) {
-    return hfBlobToResolve(new URL(`https://huggingface.co/${parts.slice(1).join("/")}${url.search}`));
+    return { target: hfBlobToResolve(new URL(`https://huggingface.co/${parts.slice(1).join("/")}${url.search}`)), isFixedShortLink: false };
   }
-  // /api/... -> HuggingFace API
   if (parts[0] === "api" && parts.length >= 2) {
-    return new URL(`https://huggingface.co/api/${parts.slice(1).join("/")}${url.search}`);
+    return { target: new URL(`https://huggingface.co/api/${parts.slice(1).join("/")}${url.search}`), isFixedShortLink: false };
   }
-  // /models/USER/MODEL/... (shortcut)
-  if (parts[0] === "models" && parts.length >= 4) {
-    return hfBlobToResolve(new URL(`https://huggingface.co/${parts.join("/")}${url.search}`));
+  if (["models", "datasets", "spaces"].includes(parts[0]) && parts.length >= 4) {
+    return { target: hfBlobToResolve(new URL(`https://huggingface.co/${parts.join("/")}${url.search}`)), isFixedShortLink: false };
   }
   return null;
 }
@@ -110,36 +104,33 @@ function safeHeaders(headers) {
   return result;
 }
 
-function isCacheableAsset(target) {
-  if (target.hostname === "huggingface.co")
-    return /\/resolve\//.test(target.pathname) && !target.pathname.endsWith("/api/");
-  if (target.hostname.endsWith(".hf.co") || target.hostname.endsWith(".huggingface.co"))
-    return true;
-  return false;
-}
-
-// 判断是否为文件下载（需要强制 attachment）
-function isFileDownload(target) {
-  if (target.hostname === "huggingface.co" && /\/resolve\//.test(target.pathname)) return true;
-  if (target.hostname.endsWith(".hf.co") || target.hostname.endsWith(".huggingface.co")) return true;
-  if (target.hostname === "hf-hub-lfs-prod.s3.us-east-1.amazonaws.com") return true;
-  return false;
+function isHfFileAsset(url) {
+  return url.hostname === "huggingface.co" && /\/resolve\//.test(url.pathname)
+    || ["cdn-lfs.huggingface.co", "hf-hub-lfs-prod.s3.us-east-1.amazonaws.com", "cdn.hf.co", "us.aws.cdn.hf.co", "cas-server.xethub.hf.co", "transfer.xethub.hf.co"].includes(url.hostname);
 }
 
 function proxyUrl(requestUrl, target) {
   return `${requestUrl.origin}/${target.href}`;
 }
 
+function fileNameFromTarget(target) {
+  const pathname = target.pathname;
+  return decodeURIComponent(pathname.split("/").pop() || "download").replace(/["\\]/g, "_");
+}
+
 async function proxy(request, env) {
   const requestUrl = new URL(request.url);
-  let target;
+  let route;
   try {
-    target = targetFromRequest(requestUrl, env);
+    route = targetFromRequest(requestUrl, env);
   } catch {
-    return badRequest("Fixed short link target is invalid");
+    return badRequest("Invalid fixed short link target");
   }
-  if (!target) return requestUrl.pathname === "/" ? html() : badRequest("Use /hf/USER/MODEL/... or /https://huggingface.co/...");
-  if (target.protocol !== "https:" || !ALLOWED_HOSTS.has(target.hostname)) return badRequest("Target host is not allowed");
+  if (!route) return requestUrl.pathname === "/" ? html() : badRequest("Use /hf/OWNER/REPO/..., /SHORT_NAME, or /https://huggingface.co/...");
+
+  const { target, isFixedShortLink } = route;
+  if (target.protocol !== "https:") return badRequest("Target protocol is not allowed");
+  if (!isFixedShortLink && !ALLOWED_HOSTS.has(target.hostname)) return badRequest("Target host is not allowed");
   if (!["GET", "HEAD", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405, headers: { allow: "GET, HEAD, POST" } });
 
   const init = {
@@ -153,7 +144,7 @@ async function proxy(request, env) {
   try {
     upstream = await fetch(target, init);
   } catch {
-    return new Response("Unable to reach HuggingFace upstream", { status: 502 });
+    return new Response("Unable to reach Hugging Face upstream", { status: 502 });
   }
 
   const headers = safeHeaders(upstream.headers);
@@ -167,21 +158,13 @@ async function proxy(request, env) {
     }
   }
 
-  // 强制浏览器下载，而不是在页面中打开
-  if (isFileDownload(target) && request.method === "GET" && upstream.ok) {
-    // 从路径中提取文件名
-    const pathname = target.hostname.endsWith(".hf.co") || target.hostname.endsWith(".huggingface.co")
-      ? new URL(upstream.headers.get("x-final-url") || target).pathname
-      : target.pathname;
-    const filename = decodeURIComponent(pathname.split("/").pop() || "download");
-    if (!headers.has("content-disposition")) {
-      headers.set("content-disposition", `attachment; filename="${filename}"`);
-    }
-  }
-
-  // Model files are immutable at a resolve URL. Cache at edge for a year.
-  if (isCacheableAsset(target) && request.method === "GET" && !request.headers.has("range") && upstream.ok) {
+  // Hugging Face resolved files and CDN artifacts are immutable at revisioned URLs.
+  // Range requests keep upstream semantics and are deliberately not force-cached.
+  if (isHfFileAsset(target) && request.method === "GET" && !request.headers.has("range") && upstream.ok) {
     headers.set("cache-control", "public, max-age=31536000, immutable");
+    if (!headers.has("content-disposition")) {
+      headers.set("content-disposition", `attachment; filename="${fileNameFromTarget(target)}"`);
+    }
   } else if (target.hostname === "huggingface.co" && target.pathname.startsWith("/api/")) {
     headers.set("cache-control", "no-store");
   }
