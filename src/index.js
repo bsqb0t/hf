@@ -15,6 +15,9 @@ const HOP_BY_HOP_HEADERS = new Set([
   "cf-connecting-ip", "cf-ipcountry", "cf-ray", "x-forwarded-for",
 ]);
 
+const RESERVED_ROUTES = new Set(["hf", "api", "models", "https:"]);
+const SHORT_LINK_ENV_NAMES = ["SHORT_LINKS", "FIXED_LINKS", "LINKS"];
+
 function html() {
   return new Response(UI, {
     headers: { "content-type": "text/html; charset=UTF-8", "cache-control": "no-store" },
@@ -33,7 +36,46 @@ function hfBlobToResolve(target) {
   return new URL(`https://huggingface.co${p.replace("/blob/", "/resolve/")}${target.search}`);
 }
 
-function targetFromRequest(url) {
+function parseShortLinks(value) {
+  if (!value) return {};
+
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+
+  if (trimmed.startsWith("{")) return JSON.parse(trimmed);
+
+  return Object.fromEntries(trimmed.split(/\r?\n/).map((line) => {
+    const clean = line.trim();
+    if (!clean || clean.startsWith("#")) return null;
+    const separator = clean.includes("=") ? "=" : ":";
+    const index = clean.indexOf(separator);
+    if (index < 1) return null;
+    return [clean.slice(0, index).trim(), clean.slice(index + 1).trim()];
+  }).filter(Boolean));
+}
+
+function shortLinksFromEnv(env = {}) {
+  for (const name of SHORT_LINK_ENV_NAMES) {
+    if (typeof env[name] === "string" && env[name].trim()) return parseShortLinks(env[name]);
+  }
+  return {};
+}
+
+function shortLinkTarget(url, env) {
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length !== 1 || RESERVED_ROUTES.has(parts[0])) return null;
+
+  const links = shortLinksFromEnv(env);
+  const target = links[parts[0]];
+  if (typeof target !== "string" || !target.trim()) return null;
+
+  return hfBlobToResolve(new URL(target.trim()));
+}
+
+function targetFromRequest(url, env) {
+  const fixedTarget = shortLinkTarget(url, env);
+  if (fixedTarget) return fixedTarget;
+
   // Full HuggingFace URL form: /https://huggingface.co/user/model/resolve/main/file
   const raw = url.href.slice(url.origin.length + 1);
   if (raw.startsWith("https://")) return hfBlobToResolve(new URL(raw));
@@ -83,10 +125,15 @@ function proxyUrl(requestUrl, target) {
   return `${requestUrl.origin}/${target.href}`;
 }
 
-async function proxy(request) {
+async function proxy(request, env) {
   const requestUrl = new URL(request.url);
-  const target = targetFromRequest(requestUrl);
-  if (!target) return requestUrl.pathname === "/" ? html() : badRequest("Use /hf/USER/MODEL/... or /https://huggingface.co/...");
+  let target;
+  try {
+    target = targetFromRequest(requestUrl, env);
+  } catch {
+    return badRequest("Invalid fixed short link target");
+  }
+  if (!target) return requestUrl.pathname === "/" ? html() : badRequest("Use /hf/USER/MODEL/..., /SHORT_NAME, or /https://huggingface.co/...");
   if (target.protocol !== "https:" || !ALLOWED_HOSTS.has(target.hostname)) return badRequest("Target host is not allowed");
   if (!["GET", "HEAD", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405, headers: { allow: "GET, HEAD, POST" } });
 
