@@ -1,7 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "cf-hf-link",
+  "name": "hf",
   "main": "src/index.js",
   "compatibility_date": "2026-07-11",
-  "workers_dev": true
+  "workers_dev": true,
+  "keep_vars": true
 }
