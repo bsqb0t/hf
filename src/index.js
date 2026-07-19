@@ -15,6 +15,9 @@ const HOP_BY_HOP_HEADERS = new Set([
   "cf-connecting-ip", "cf-ipcountry", "cf-ray", "x-forwarded-for",
 ]);
 
+const FIXED_LINK_VARIABLES = ["SHORT_LINKS", "FIXED_LINKS", "LINKS"];
+const RESERVED_SHORT_LINKS = new Set(["", "hf", "api", "models", "https:"]);
+
 function html() {
   return new Response(UI, {
     headers: { "content-type": "text/html; charset=UTF-8", "cache-control": "no-store" },
@@ -25,6 +28,47 @@ function badRequest(message) {
   return new Response(message, { status: 400, headers: { "content-type": "text/plain; charset=UTF-8" } });
 }
 
+function firstFixedLinksConfig(env = {}) {
+  for (const name of FIXED_LINK_VARIABLES) {
+    if (typeof env[name] === "string" && env[name].trim()) return env[name].trim();
+  }
+  return "";
+}
+
+function parseFixedLinks(config) {
+  if (!config) return {};
+  try {
+    const parsed = JSON.parse(config);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  } catch {
+    // Fall back to line-based KEY=URL parsing.
+  }
+
+  return Object.fromEntries(
+    config
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+      .map((line) => {
+        const separator = line.indexOf("=");
+        if (separator === -1) return null;
+        return [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
+      })
+      .filter(Boolean),
+  );
+}
+
+function fixedLinkTarget(url, env) {
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length !== 1 || RESERVED_SHORT_LINKS.has(parts[0])) return null;
+
+  const fixedLinks = parseFixedLinks(firstFixedLinksConfig(env));
+  const target = fixedLinks[parts[0]];
+  if (typeof target !== "string" || !target.trim()) return null;
+
+  return hfBlobToResolve(new URL(target.trim()));
+}
+
 // blob → resolve: HuggingFace blob 页面转直接下载
 function hfBlobToResolve(target) {
   if (target.hostname !== "huggingface.co") return target;
@@ -33,7 +77,10 @@ function hfBlobToResolve(target) {
   return new URL(`https://huggingface.co${p.replace("/blob/", "/resolve/")}${target.search}`);
 }
 
-function targetFromRequest(url) {
+function targetFromRequest(url, env) {
+  const fixedTarget = fixedLinkTarget(url, env);
+  if (fixedTarget) return fixedTarget;
+
   // Full HuggingFace URL form: /https://huggingface.co/user/model/resolve/main/file
   const raw = url.href.slice(url.origin.length + 1);
   if (raw.startsWith("https://")) return hfBlobToResolve(new URL(raw));
@@ -83,9 +130,14 @@ function proxyUrl(requestUrl, target) {
   return `${requestUrl.origin}/${target.href}`;
 }
 
-async function proxy(request) {
+async function proxy(request, env) {
   const requestUrl = new URL(request.url);
-  const target = targetFromRequest(requestUrl);
+  let target;
+  try {
+    target = targetFromRequest(requestUrl, env);
+  } catch {
+    return badRequest("Fixed short link target is invalid");
+  }
   if (!target) return requestUrl.pathname === "/" ? html() : badRequest("Use /hf/USER/MODEL/... or /https://huggingface.co/...");
   if (target.protocol !== "https:" || !ALLOWED_HOSTS.has(target.hostname)) return badRequest("Target host is not allowed");
   if (!["GET", "HEAD", "POST"].includes(request.method)) return new Response("Method not allowed", { status: 405, headers: { allow: "GET, HEAD, POST" } });
